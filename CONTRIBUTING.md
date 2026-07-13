@@ -27,6 +27,9 @@ docker build -t s3-copy-gateway:dev .
 
 Before opening a pull request, ensure `make ci` passes from a clean checkout.
 
+Maintainers should follow [RELEASING.md](RELEASING.md) and must not reuse or
+move a published release tag.
+
 ## Reporting security issues
 
 Do not open a public issue for a suspected vulnerability. Follow

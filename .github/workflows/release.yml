@@ -1,0 +1,517 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      commit: ${{ steps.metadata.outputs.commit }}
+      image: ${{ steps.metadata.outputs.image }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      source_date_epoch: ${{ steps.metadata.outputs.source_date_epoch }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag and derive metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          if [[ ! "$tag" =~ $semver ]]; then
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          tag_commit="$(git rev-parse "${tag}^{commit}")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "release tag must point to a commit on main: $tag_commit" >&2
+            exit 1
+          fi
+
+          api_error="$(mktemp)"
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$api_error")"; then
+            if ! jq -e '.draft == true' <<< "$release_json" >/dev/null; then
+              echo "a published release already exists for $tag" >&2
+              exit 1
+            fi
+          elif ! grep -q 'HTTP 404' "$api_error"; then
+            cat "$api_error" >&2
+            exit 1
+          fi
+          rm -f "$api_error"
+
+          version="${tag#v}"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+
+          {
+            echo "version=$version"
+            echo "commit=$tag_commit"
+            echo "prerelease=$prerelease"
+            echo "build_date=$(git show -s --format=%cI "$tag_commit")"
+            echo "source_date_epoch=$(git show -s --format=%ct "$tag_commit")"
+            echo "image=ghcr.io/${repository}"
+          } >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Release checks
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.25.x
+          check-latest: true
+          cache: false
+
+      - name: Scan known vulnerabilities
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          repo-checkout: false
+          go-version-input: 1.25.x
+          check-latest: true
+          go-package: ./...
+
+      - name: Run checks
+        run: make ci
+
+  binaries:
+    name: Binary linux/${{ matrix.goarch }}
+    needs:
+      - prepare
+      - quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch:
+          - amd64
+          - arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.25.x
+          check-latest: true
+          cache: false
+
+      - name: Build archive
+        env:
+          BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
+          GOARCH: ${{ matrix.goarch }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_root="s3-copy-gateway_${RELEASE_VERSION}_linux_${GOARCH}"
+          output_dir="dist/${archive_root}"
+          archive="dist/${archive_root}.tar.gz"
+          mkdir -p "$output_dir"
+
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${RELEASE_TAG} -X main.commit=${RELEASE_COMMIT} -X main.buildDate=${BUILD_DATE}" \
+            -o "${output_dir}/s3-copy-gateway" .
+
+          cp LICENSE README.md "$output_dir/"
+          mkdir -p "${output_dir}/config"
+          cp config/example.env "${output_dir}/config/"
+          go version -m "${output_dir}/s3-copy-gateway"
+
+          if [[ "$GOARCH" == "amd64" ]]; then
+            version_output="$("${output_dir}/s3-copy-gateway" --version)"
+            grep -F "version=${RELEASE_TAG}" <<< "$version_output"
+            grep -F "commit=${RELEASE_COMMIT}" <<< "$version_output"
+          fi
+
+          tar --sort=name \
+            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --owner=0 --group=0 --numeric-owner \
+            -C dist -cf - "$archive_root" \
+            | gzip -n > "$archive"
+          rm -rf "$output_dir"
+
+          diff -u \
+            <(printf '%s\n' \
+              "${archive_root}/" \
+              "${archive_root}/LICENSE" \
+              "${archive_root}/README.md" \
+              "${archive_root}/config/" \
+              "${archive_root}/config/example.env" \
+              "${archive_root}/s3-copy-gateway" | LC_ALL=C sort) \
+            <(tar -tzf "$archive" | LC_ALL=C sort)
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-linux-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  image:
+    name: Multi-architecture image
+    needs:
+      - prepare
+      - quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.title=s3-copy-gateway
+            org.opencontainers.image.description=Minimal S3 CopyObject compatibility gateway
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.build_date }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ needs.prepare.outputs.commit }}
+            BUILD_DATE=${{ needs.prepare.outputs.build_date }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify image manifest and tags
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(docker buildx imagetools inspect --raw "${IMAGE}@${IMAGE_DIGEST}")"
+          actual_platforms="$(
+            jq -r '.manifests[] | select(.platform.os == "linux") | "\(.platform.os)/\(.platform.architecture)"' \
+              <<< "$manifest" | LC_ALL=C sort -u
+          )"
+          expected_platforms=$'linux/amd64\nlinux/arm64'
+          if [[ "$actual_platforms" != "$expected_platforms" ]]; then
+            printf 'unexpected image platforms:\n%s\n' "$actual_platforms" >&2
+            exit 1
+          fi
+
+          for image_tag in "$RELEASE_TAG" "$RELEASE_VERSION"; do
+            tag_digest="$(
+              docker buildx imagetools inspect "${IMAGE}:${image_tag}" \
+                | awk '$1 == "Digest:" {print $2; exit}'
+            )"
+            if [[ "$tag_digest" != "$IMAGE_DIGEST" ]]; then
+              echo "${IMAGE}:${image_tag} resolved to ${tag_digest}, expected ${IMAGE_DIGEST}" >&2
+              exit 1
+            fi
+          done
+
+  image-smoke:
+    name: Public image smoke ${{ matrix.platform }}
+    needs:
+      - prepare
+      - image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+          - platform: linux/arm64
+            suffix: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Pull and start public image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SUFFIX: ${{ matrix.suffix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE}@${IMAGE_DIGEST}"
+          container_name="s3-copy-gateway-release-${SUFFIX}"
+          trap 'docker rm --force "$container_name" >/dev/null 2>&1 || true' EXIT
+
+          # This job intentionally never logs in to GHCR.
+          docker pull --platform "$PLATFORM" "$image_ref"
+          version_output="$(docker run --rm --platform "$PLATFORM" "$image_ref" --version)"
+          grep -F "version=${RELEASE_TAG}" <<< "$version_output"
+          grep -F "commit=${RELEASE_COMMIT}" <<< "$version_output"
+
+          docker run --detach \
+            --platform "$PLATFORM" \
+            --name "$container_name" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --env-file config/example.env \
+            --publish 127.0.0.1:18080:8080 \
+            "$image_ref"
+
+          test "$(docker inspect --format '{{.Config.User}}' "$container_name")" = "65532:65532"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_name")" = "true"
+          test "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$container_name")" = '["ALL"]'
+          docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container_name" \
+            | grep -F 'no-new-privileges'
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/healthz; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+
+          docker logs "$container_name"
+          exit 1
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - binaries
+      - image
+      - image-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets and create release notes
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print | wc -l | tr -d ' ')"
+          if [[ "$archive_count" -ne 2 ]]; then
+            echo "expected two binary archives, found $archive_count" >&2
+            exit 1
+          fi
+
+          for goarch in amd64 arm64; do
+            archive_root="s3-copy-gateway_${RELEASE_VERSION}_linux_${goarch}"
+            archive="dist/${archive_root}.tar.gz"
+            test -f "$archive"
+            diff -u \
+              <(printf '%s\n' \
+                "${archive_root}/" \
+                "${archive_root}/LICENSE" \
+                "${archive_root}/README.md" \
+                "${archive_root}/config/" \
+                "${archive_root}/config/example.env" \
+                "${archive_root}/s3-copy-gateway" | LC_ALL=C sort) \
+              <(tar -tzf "$archive" | LC_ALL=C sort)
+          done
+
+          (
+            cd dist
+            LC_ALL=C sha256sum ./*.tar.gz > SHA256SUMS
+          )
+
+          cat > release-notes.md <<EOF
+          ## Container image
+
+          Pull by immutable digest (recommended):
+
+          \`\`\`bash
+          docker pull ${IMAGE}@${IMAGE_DIGEST}
+          \`\`\`
+
+          Pull by release tag:
+
+          \`\`\`bash
+          docker pull ${IMAGE}:${RELEASE_TAG}
+          \`\`\`
+
+          The public multi-architecture image supports \`linux/amd64\` and
+          \`linux/arm64\`. It is published as both \`${IMAGE}:${RELEASE_TAG}\`
+          and \`${IMAGE}:${RELEASE_VERSION}\`.
+
+          ## Binary assets
+
+          - \`s3-copy-gateway_${RELEASE_VERSION}_linux_amd64.tar.gz\`
+          - \`s3-copy-gateway_${RELEASE_VERSION}_linux_arm64.tar.gz\`
+          - \`SHA256SUMS\`
+
+          Verify downloads with:
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS
+          \`\`\`
+          EOF
+
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_error="$(mktemp)"
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>"$api_error")"; then
+            if ! jq -e '.draft == true' <<< "$release_json" >/dev/null; then
+              echo "release already exists and is not a draft: $RELEASE_TAG" >&2
+              exit 1
+            fi
+          elif grep -q 'HTTP 404' "$api_error"; then
+            release_flags=(
+              --repo "$GITHUB_REPOSITORY"
+              --draft
+              --verify-tag
+              --title "s3-copy-gateway ${RELEASE_TAG}"
+              --generate-notes
+              --notes-file release-notes.md
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${release_flags[@]}"
+          else
+            cat "$api_error" >&2
+            exit 1
+          fi
+          rm -f "$api_error"
+
+          gh release upload "$RELEASE_TAG" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            "s3-copy-gateway_${RELEASE_TAG#v}_linux_amd64.tar.gz" \
+            "s3-copy-gateway_${RELEASE_TAG#v}_linux_arm64.tar.gz" \
+            | LC_ALL=C sort)"
+          actual_assets="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              --jq '.assets[].name' | LC_ALL=C sort
+          )"
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            printf 'unexpected release assets:\n%s\n' "$actual_assets" >&2
+            exit 1
+          fi
+
+          release_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id'
+          )"
+          make_latest=false
+          if [[ "$PRERELEASE" == "false" ]]; then
+            make_latest=true
+          fi
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false \
+            -F prerelease="$PRERELEASE" \
+            -f make_latest="$make_latest" >/dev/null
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --jq 'select(.draft == false) | .html_url'

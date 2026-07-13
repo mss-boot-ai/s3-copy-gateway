@@ -14,12 +14,39 @@ import (
 	"github.com/mss-boot-ai/s3-copy-gateway/internal/copygateway"
 )
 
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
+
 func main() {
+	if isVersionCommand(os.Args[1:]) {
+		fmt.Println(versionString(version, commit, buildDate))
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
 		logger.Error("s3 copy gateway stopped with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func isVersionCommand(args []string) bool {
+	if len(args) != 1 {
+		return false
+	}
+	switch args[0] {
+	case "version", "-version", "--version":
+		return true
+	default:
+		return false
+	}
+}
+
+func versionString(releaseVersion, releaseCommit, releaseBuildDate string) string {
+	return fmt.Sprintf("s3-copy-gateway version=%s commit=%s build_date=%s", releaseVersion, releaseCommit, releaseBuildDate)
 }
 
 func run(logger *slog.Logger) error {

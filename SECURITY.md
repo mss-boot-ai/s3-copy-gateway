@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest commit on the default branch. Tagged
-release support will be documented here when releases are introduced.
+Security fixes are applied to the latest stable release and the default branch.
+Older release lines and pre-releases are not supported.
 
 ## Reporting a vulnerability
 

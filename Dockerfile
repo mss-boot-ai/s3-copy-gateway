@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS build
 
 WORKDIR /src
 
@@ -9,10 +9,15 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
 RUN CGO_ENABLED=0 \
     GOOS="${TARGETOS:-linux}" \
     GOARCH="${TARGETARCH:-amd64}" \
-    go build -trimpath -ldflags="-s -w" -o /out/s3-copy-gateway .
+    go build -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
+      -o /out/s3-copy-gateway .
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:b7bb25d9f7c31d2bdd1982feb4dafcaf137703c7075dbe2febb41c24212b946f
 
