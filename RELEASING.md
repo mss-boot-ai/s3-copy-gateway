@@ -10,6 +10,13 @@ publishes both GitHub Release assets and the corresponding GHCR image.
 3. Choose a tag matching `vMAJOR.MINOR.PATCH`. Pre-release identifiers such as
    `v1.2.0-rc.1` are supported.
 
+GitHub creates the first GHCR package as private. During the first release only,
+wait for the image job to push it, change the package visibility to **Public**
+in [GitHub package settings](https://github.com/orgs/mss-boot-ai/packages/container/package/s3-copy-gateway/settings),
+and rerun the failed workflow jobs. The anonymous image smoke tests
+intentionally prevent the GitHub Release from publishing until this is done.
+Package visibility remains public for later releases.
+
 ## Publish
 
 Create and push an annotated tag:

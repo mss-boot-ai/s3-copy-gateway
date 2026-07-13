@@ -53,17 +53,24 @@ jobs:
             exit 1
           fi
 
-          api_error="$(mktemp)"
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$api_error")"; then
-            if ! jq -e '.draft == true' <<< "$release_json" >/dev/null; then
-              echo "a published release already exists for $tag" >&2
-              exit 1
-            fi
-          elif ! grep -q 'HTTP 404' "$api_error"; then
-            cat "$api_error" >&2
+          releases_json="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | jq -cs 'add'
+          )"
+          matching_releases="$(
+            jq -c --arg tag "$tag" '[.[] | select(.tag_name == $tag)]' \
+              <<< "$releases_json"
+          )"
+          release_count="$(jq 'length' <<< "$matching_releases")"
+          if [[ "$release_count" -gt 1 ]]; then
+            echo "multiple releases exist for $tag" >&2
             exit 1
           fi
-          rm -f "$api_error"
+          if [[ "$release_count" -eq 1 ]] \
+            && ! jq -e '.[0].draft == true' <<< "$matching_releases" >/dev/null; then
+            echo "a published release already exists for $tag" >&2
+            exit 1
+          fi
 
           version="${tag#v}"
           prerelease=false
@@ -456,13 +463,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          api_error="$(mktemp)"
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>"$api_error")"; then
-            if ! jq -e '.draft == true' <<< "$release_json" >/dev/null; then
-              echo "release already exists and is not a draft: $RELEASE_TAG" >&2
-              exit 1
-            fi
-          elif grep -q 'HTTP 404' "$api_error"; then
+          releases_json="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | jq -cs 'add'
+          )"
+          matching_releases="$(
+            jq -c --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' \
+              <<< "$releases_json"
+          )"
+          release_count="$(jq 'length' <<< "$matching_releases")"
+          if [[ "$release_count" -gt 1 ]]; then
+            echo "multiple releases exist for $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          if [[ "$release_count" -eq 0 ]]; then
             release_flags=(
               --repo "$GITHUB_REPOSITORY"
               --draft
@@ -475,11 +490,30 @@ jobs:
               release_flags+=(--prerelease)
             fi
             gh release create "$RELEASE_TAG" "${release_flags[@]}"
-          else
-            cat "$api_error" >&2
+
+            for attempt in {1..10}; do
+              releases_json="$(
+                gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                  | jq -cs 'add'
+              )"
+              matching_releases="$(
+                jq -c --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' \
+                  <<< "$releases_json"
+              )"
+              release_count="$(jq 'length' <<< "$matching_releases")"
+              if [[ "$release_count" -ne 0 ]]; then
+                break
+              fi
+              sleep 1
+            done
+          fi
+
+          if [[ "$release_count" -ne 1 ]] \
+            || ! jq -e '.[0].draft == true' <<< "$matching_releases" >/dev/null; then
+            echo "expected exactly one draft release for $RELEASE_TAG" >&2
             exit 1
           fi
-          rm -f "$api_error"
+          release_id="$(jq -r '.[0].id' <<< "$matching_releases")"
 
           gh release upload "$RELEASE_TAG" \
             dist/*.tar.gz dist/SHA256SUMS \
@@ -492,7 +526,7 @@ jobs:
             "s3-copy-gateway_${RELEASE_TAG#v}_linux_arm64.tar.gz" \
             | LC_ALL=C sort)"
           actual_assets="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
               --jq '.assets[].name' | LC_ALL=C sort
           )"
           if [[ "$actual_assets" != "$expected_assets" ]]; then
@@ -500,9 +534,6 @@ jobs:
             exit 1
           fi
 
-          release_id="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id'
-          )"
           make_latest=false
           if [[ "$PRERELEASE" == "false" ]]; then
             make_latest=true
